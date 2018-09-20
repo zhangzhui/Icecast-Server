@@ -117,7 +117,7 @@ typedef struct _mount_proxy {
     struct event_registration_tag *event;
 
     char *cluster_password;
-    struct auth_stack_tag *authstack;
+    auth_stack_t *authstack;
     unsigned int max_listener_duration;
 
     char *stream_name;
@@ -165,6 +165,7 @@ typedef struct _listener_t {
     int shoutcast_compat;
     char *shoutcast_mount;
     tlsmode_t tls;
+    auth_stack_t *authstack;
 } listener_t;
 
 typedef struct _config_tls_context {
@@ -211,7 +212,7 @@ struct ice_config_tag {
 
     char *shoutcast_mount;
     char *shoutcast_user;
-    struct auth_stack_tag *authstack;
+    auth_stack_t *authstack;
 
     struct event_registration_tag *event;
 
@@ -270,7 +271,7 @@ struct ice_config_tag {
     char *yp_url[MAX_YP_DIRECTORIES];
     int yp_url_timeout[MAX_YP_DIRECTORIES];
     int yp_touch_interval[MAX_YP_DIRECTORIES];
-    int num_yp_directories;
+    size_t num_yp_directories;
 };
 
 typedef struct {

@@ -22,7 +22,7 @@
 #include <errno.h>
 #include <string.h>
 #ifdef HAVE_POLL
-#include <sys/poll.h>
+#include <poll.h>
 #endif
 #include <sys/types.h>
 
@@ -105,6 +105,7 @@ static matchfile_t *banned_ip, *allowed_ip;
 
 rwlock_t _source_shutdown_rwlock;
 
+static int  _update_admin_command(client_t *client);
 static void _handle_connection(void);
 static void get_tls_certificate(ice_config_t *config);
 
@@ -809,10 +810,10 @@ int connection_complete_source(source_t *source, int response)
     return -1;
 }
 
-static inline void source_startup(client_t *client, const char *uri)
+static inline void source_startup(client_t *client)
 {
     source_t *source;
-    source = source_reserve(uri);
+    source = source_reserve(client->uri);
 
     if (source) {
         source->client = client;
@@ -872,27 +873,27 @@ static inline void source_startup(client_t *client, const char *uri)
         }
     } else {
         client_send_error_by_id(client, ICECAST_ERROR_CON_MOUNT_IN_USE);
-        ICECAST_LOG_WARN("Mountpoint %s in use", uri);
+        ICECAST_LOG_WARN("Mountpoint %s in use", client->uri);
     }
 }
 
 /* only called for native icecast source clients */
-static void _handle_source_request(client_t *client, const char *uri)
+static void _handle_source_request(client_t *client)
 {
     ICECAST_LOG_INFO("Source logging in at mountpoint \"%s\" from %s as role %s",
-        uri, client->con->ip, client->role);
+        client->uri, client->con->ip, client->role);
 
-    if (uri[0] != '/') {
+    if (client->uri[0] != '/') {
         ICECAST_LOG_WARN("source mountpoint not starting with /");
         client_send_error_by_id(client, ICECAST_ERROR_CON_MOUNTPOINT_NOT_STARTING_WITH_SLASH);
         return;
     }
 
-    source_startup(client, uri);
+    source_startup(client);
 }
 
 
-static void _handle_stats_request(client_t *client, char *uri)
+static void _handle_stats_request(client_t *client)
 {
     stats_event_inc(NULL, "stats_connections");
 
@@ -988,10 +989,10 @@ static inline ssize_t __count_user_role_on_mount (source_t *source, client_t *cl
     return ret;
 }
 
-static void _handle_get_request(client_t *client, char *uri) {
+static void _handle_get_request(client_t *client) {
     source_t *source = NULL;
 
-    ICECAST_LOG_DEBUG("Got client %p with URI %H", client, uri);
+    ICECAST_LOG_DEBUG("Got client %p with URI %H", client, client->uri);
 
     /* there are several types of HTTP GET clients
      * media clients, which are looking for a source (eg, URI = /stream.ogg),
@@ -1017,16 +1018,16 @@ static void _handle_get_request(client_t *client, char *uri) {
         return;
     }
 
-    if (util_check_valid_extension(uri) == XSLT_CONTENT) {
+    if (util_check_valid_extension(client->uri) == XSLT_CONTENT) {
         /* If the file exists, then transform it, otherwise, write a 404 */
         ICECAST_LOG_DEBUG("Stats request, sending XSL transformed stats");
-        stats_transform_xslt(client, uri);
+        stats_transform_xslt(client);
         return;
     }
 
     avl_tree_rlock(global.source_tree);
     /* let's see if this is a source or just a random fserve file */
-    source = source_find_mount(uri);
+    source = source_find_mount(client->uri);
     if (source) {
         /* true mount */
         int in_error = 0;
@@ -1061,7 +1062,7 @@ static void _handle_get_request(client_t *client, char *uri) {
     } else {
         /* file */
         avl_tree_unlock(global.source_tree);
-        fserve_client_create(client, uri);
+        fserve_client_create(client);
     }
 }
 
@@ -1272,43 +1273,42 @@ static void _handle_admin_request(client_t *client, char *adminuri)
 
 /* Handle any client that passed the authing process.
  */
-static void _handle_authed_client(client_t *client, void *uri, auth_result result)
+static void _handle_authed_client(client_t *client, void *userdata, auth_result result)
 {
     auth_stack_release(client->authstack);
     client->authstack = NULL;
+
+    /* Update admin parameters just in case auth changed our URI */
+    if (_update_admin_command(client) == -1)
+        return;
 
     fastevent_emit(FASTEVENT_TYPE_CLIENT_AUTHED, FASTEVENT_FLAG_MODIFICATION_ALLOWED, FASTEVENT_DATATYPE_CLIENT, client);
 
     if (result != AUTH_OK) {
         client_send_error_by_id(client, ICECAST_ERROR_GEN_CLIENT_NEEDS_TO_AUTHENTICATE);
-        free(uri);
         return;
     }
 
     if (acl_test_method(client->acl, client->parser->req_type) != ACL_POLICY_ALLOW) {
-        ICECAST_LOG_ERROR("Client (role=%s, username=%s) not allowed to use this request method on %H", client->role, client->username, uri);
+        ICECAST_LOG_ERROR("Client (role=%s, username=%s) not allowed to use this request method on %H", client->role, client->username, client->uri);
         client_send_error_by_id(client, ICECAST_ERROR_GEN_CLIENT_NEEDS_TO_AUTHENTICATE);
-        free(uri);
         return;
     }
 
     /* Dispatch legacy admin.cgi requests */
-    if (strcmp(uri, "/admin.cgi") == 0) {
-        _handle_admin_request(client, uri + 1);
-        free(uri);
+    if (strcmp(client->uri, "/admin.cgi") == 0) {
+        _handle_admin_request(client, client->uri + 1);
         return;
     } /* Dispatch all admin requests */
-    else if (strncmp(uri, "/admin/", 7) == 0) {
-        _handle_admin_request(client, uri + 7);
-        free(uri);
+    else if (strncmp(client->uri, "/admin/", 7) == 0) {
+        _handle_admin_request(client, client->uri + 7);
         return;
     }
 
     if (client->handler_module && client->handler_function) {
         const module_client_handler_t *handler = module_get_client_handler(client->handler_module, client->handler_function);
         if (handler) {
-            handler->cb(client->handler_module, client, uri);
-            free(uri);
+            handler->cb(client->handler_module, client);
             return;
         } else {
             ICECAST_LOG_ERROR("No such handler function in module: %s", client->handler_function);
@@ -1318,29 +1318,27 @@ static void _handle_authed_client(client_t *client, void *uri, auth_result resul
     switch (client->parser->req_type) {
         case httpp_req_source:
         case httpp_req_put:
-            _handle_source_request(client, uri);
+            _handle_source_request(client);
         break;
         case httpp_req_stats:
-            _handle_stats_request(client, uri);
+            _handle_stats_request(client);
         break;
         case httpp_req_get:
         case httpp_req_post:
         case httpp_req_options:
-            _handle_get_request(client, uri);
+            _handle_get_request(client);
         break;
         default:
             ICECAST_LOG_ERROR("Wrong request type from client");
             client_send_error_by_id(client, ICECAST_ERROR_CON_UNKNOWN_REQUEST);
         break;
     }
-
-    free(uri);
 }
 
 /* Handle clients that still need to authenticate.
  */
 
-static void _handle_authentication_global(client_t *client, void *uri, auth_result result)
+static void _handle_authentication_global(client_t *client, void *userdata, auth_result result)
 {
     ice_config_t *config;
 
@@ -1348,14 +1346,14 @@ static void _handle_authentication_global(client_t *client, void *uri, auth_resu
     client->authstack = NULL;
 
     if (result != AUTH_NOMATCH &&
-        !(result == AUTH_OK && client->admin_command != -1 && acl_test_admin(client->acl, client->admin_command) == ACL_POLICY_DENY)) {
-        _handle_authed_client(client, uri, result);
+        !(result == AUTH_OK && client->admin_command != ADMIN_COMMAND_ERROR && acl_test_admin(client->acl, client->admin_command) == ACL_POLICY_DENY)) {
+        _handle_authed_client(client, userdata, result);
         return;
     }
 
     ICECAST_LOG_DEBUG("Trying global authenticators for client %p.", client);
     config = config_get_config();
-    auth_stack_add_client(config->authstack, client, _handle_authed_client, uri);
+    auth_stack_add_client(config->authstack, client, _handle_authed_client, userdata);
     config_release_config();
 }
 
@@ -1367,14 +1365,14 @@ static inline mount_proxy * __find_non_admin_mount(ice_config_t *config, const c
     return config_find_mount(config, name, type);
 }
 
-static void _handle_authentication_mount_generic(client_t *client, void *uri, mount_type type, void (*callback)(client_t*, void*, auth_result))
+static void _handle_authentication_mount_generic(client_t *client, void *userdata, mount_type type, void (*callback)(client_t*, void*, auth_result))
 {
     ice_config_t *config;
     mount_proxy *mountproxy;
     auth_stack_t *stack = NULL;
 
     config = config_get_config();
-    mountproxy = __find_non_admin_mount(config, uri, type);
+    mountproxy = __find_non_admin_mount(config, client->uri, type);
     if (!mountproxy) {
         int command_type = admin_get_command_type(client->admin_command);
         if (command_type == ADMINTYPE_MOUNT || command_type == ADMINTYPE_HYBRID) {
@@ -1389,38 +1387,68 @@ static void _handle_authentication_mount_generic(client_t *client, void *uri, mo
     config_release_config();
 
     if (stack) {
-        auth_stack_add_client(stack, client, callback, uri);
+        auth_stack_add_client(stack, client, callback, userdata);
         auth_stack_release(stack);
     } else {
-        callback(client, uri, AUTH_NOMATCH);
+        callback(client, userdata, AUTH_NOMATCH);
     }
 }
 
-static void _handle_authentication_mount_default(client_t *client, void *uri, auth_result result)
+static void _handle_authentication_mount_default(client_t *client, void *userdata, auth_result result)
 {
     auth_stack_release(client->authstack);
     client->authstack = NULL;
 
     if (result != AUTH_NOMATCH &&
-        !(result == AUTH_OK && client->admin_command != -1 && acl_test_admin(client->acl, client->admin_command) == ACL_POLICY_DENY)) {
-        _handle_authed_client(client, uri, result);
+        !(result == AUTH_OK && client->admin_command != ADMIN_COMMAND_ERROR && acl_test_admin(client->acl, client->admin_command) == ACL_POLICY_DENY)) {
+        _handle_authed_client(client, userdata, result);
         return;
     }
 
     ICECAST_LOG_DEBUG("Trying <mount type=\"default\"> specific authenticators for client %p.", client);
-    _handle_authentication_mount_generic(client, uri, MOUNT_TYPE_DEFAULT, _handle_authentication_global);
+    _handle_authentication_mount_generic(client, userdata, MOUNT_TYPE_DEFAULT, _handle_authentication_global);
 }
 
-static void _handle_authentication_mount_normal(client_t *client, char *uri)
+static void _handle_authentication_mount_normal(client_t *client, void *userdata, auth_result result)
 {
+    auth_stack_release(client->authstack);
+    client->authstack = NULL;
+
+    if (result != AUTH_NOMATCH &&
+        !(result == AUTH_OK && client->admin_command != ADMIN_COMMAND_ERROR && acl_test_admin(client->acl, client->admin_command) == ACL_POLICY_DENY)) {
+        _handle_authed_client(client, userdata, result);
+        return;
+    }
+
     ICECAST_LOG_DEBUG("Trying <mount type=\"normal\"> specific authenticators for client %p.", client);
-    _handle_authentication_mount_generic(client, uri, MOUNT_TYPE_NORMAL, _handle_authentication_mount_default);
+    _handle_authentication_mount_generic(client, userdata, MOUNT_TYPE_NORMAL, _handle_authentication_mount_default);
 }
 
-static void _handle_authentication(client_t *client, char *uri)
+static void _handle_authentication_listen_socket(client_t *client)
+{
+    auth_stack_t *stack = NULL;
+    const listener_t *listener;
+
+    listener = listensocket_get_listener(client->con->listensocket_effective);
+    if (listener) {
+        if (listener->authstack) {
+            auth_stack_addref(stack = listener->authstack);
+        }
+        listensocket_release_listener(client->con->listensocket_effective);
+    }
+
+    if (stack) {
+        auth_stack_add_client(stack, client, _handle_authentication_mount_normal, NULL);
+        auth_stack_release(stack);
+    } else {
+        _handle_authentication_mount_normal(client, NULL, AUTH_NOMATCH);
+    }
+}
+
+static void _handle_authentication(client_t *client)
 {
     fastevent_emit(FASTEVENT_TYPE_CLIENT_READY_FOR_AUTH, FASTEVENT_FLAG_MODIFICATION_ALLOWED, FASTEVENT_DATATYPE_CLIENT, client);
-    _handle_authentication_mount_normal(client, uri);
+    _handle_authentication_listen_socket(client);
 }
 
 static void __prepare_shoutcast_admin_cgi_request(client_t *client)
@@ -1478,6 +1506,23 @@ static int _need_body(client_queue_t *node)
         return 1;
     } else if (client->request_body_length == -1 && client_body_eof(client) == 0) {
         return 1;
+    }
+
+    return 0;
+}
+
+/* Updates client's admin_command */
+static int _update_admin_command(client_t *client)
+{
+    if (strcmp(client->uri, "/admin.cgi") == 0) {
+        client->admin_command = admin_get_command(client->uri + 1);
+        __prepare_shoutcast_admin_cgi_request(client);
+        if (!client->password) {
+            client_send_error_by_id(client, ICECAST_ERROR_CON_MISSING_PASS_PARAMETER);
+            return -1;
+        }
+    } else if (strncmp(client->uri, "/admin/", 7) == 0) {
+        client->admin_command = admin_get_command(client->uri + 7);
     }
 
     return 0;
@@ -1580,6 +1625,7 @@ static void _handle_connection(void)
                 }
 
                 if (parser->req_type == httpp_req_options && strcmp(rawuri, "*") == 0) {
+                    client->uri = strdup("*");
                     client_send_204(client);
                     continue;
                 }
@@ -1598,18 +1644,12 @@ static void _handle_connection(void)
                     continue;
                 }
 
-                if (strcmp(uri, "/admin.cgi") == 0) {
-                    client->admin_command = admin_get_command(uri + 1);
-                    __prepare_shoutcast_admin_cgi_request(client);
-                    if (!client->password) {
-                        client_send_error_by_id(client, ICECAST_ERROR_CON_MISSING_PASS_PARAMETER);
-                        continue;
-                    }
-                } else if (strncmp("/admin/", uri, 7) == 0) {
-                    client->admin_command = admin_get_command(uri + 7);
-                }
+                client->uri = uri;
 
-                _handle_authentication(client, uri);
+                if (_update_admin_command(client) == -1)
+                    continue;
+
+                _handle_authentication(client);
             } else {
                 free (node);
                 ICECAST_LOG_ERROR("HTTP request parsing failed");

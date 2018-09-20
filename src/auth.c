@@ -62,40 +62,43 @@ static unsigned long _next_auth_id(void) {
     return id;
 }
 
+static const struct {
+    auth_result result;
+    const char *string;
+} __auth_results[] = {
+    {.result = AUTH_UNDEFINED,      .string = "undefined"},
+    {.result = AUTH_OK,             .string = "ok"},
+    {.result = AUTH_FAILED,         .string = "failed"},
+    {.result = AUTH_RELEASED,       .string = "released"},
+    {.result = AUTH_FORBIDDEN,      .string = "forbidden"},
+    {.result = AUTH_NOMATCH,        .string = "no match"},
+    {.result = AUTH_USERADDED,      .string = "user added"},
+    {.result = AUTH_USEREXISTS,     .string = "user exists"},
+    {.result = AUTH_USERDELETED,    .string = "user deleted"}
+};
+
 static const char *auth_result2str(auth_result res)
 {
-    switch (res) {
-        case AUTH_UNDEFINED:
-            return "undefined";
-        break;
-        case AUTH_OK:
-            return "ok";
-        break;
-        case AUTH_FAILED:
-            return "failed";
-        break;
-        case AUTH_RELEASED:
-            return "released";
-        break;
-        case AUTH_FORBIDDEN:
-            return "forbidden";
-        break;
-        case AUTH_NOMATCH:
-            return "no match";
-        break;
-        case AUTH_USERADDED:
-            return "user added";
-        break;
-        case AUTH_USEREXISTS:
-            return "user exists";
-        break;
-        case AUTH_USERDELETED:
-            return "user deleted";
-        break;
-        default:
-            return "(unknown)";
-        break;
+    size_t i;
+
+    for (i = 0; i < (sizeof(__auth_results)/sizeof(*__auth_results)); i++) {
+        if (__auth_results[i].result == res)
+            return __auth_results[i].string;
     }
+
+    return "(unknown)";
+}
+
+auth_result auth_str2result(const char *str)
+{
+    size_t i;
+
+    for (i = 0; i < (sizeof(__auth_results)/sizeof(*__auth_results)); i++) {
+        if (strcasecmp(__auth_results[i].string, str) == 0)
+            return __auth_results[i].result;
+    }
+
+    return AUTH_FAILED;
 }
 
 static auth_client *auth_client_setup (client_t *client)
@@ -227,9 +230,11 @@ void    auth_addref (auth_t *authenticator) {
 
 static void auth_client_free (auth_client *auth_user)
 {
-    if (auth_user == NULL)
+    if (!auth_user)
         return;
-    free (auth_user);
+
+    free(auth_user->alter_client_arg);
+    free(auth_user);
 }
 
 
@@ -295,6 +300,55 @@ static auth_result auth_remove_client(auth_t *auth, auth_client *auth_user)
     return ret;
 }
 
+static inline int __handle_auth_client_alter(auth_t *auth, auth_client *auth_user)
+{
+    client_t *client = auth_user->client;
+    const char *uuid = NULL;
+    const char *location = NULL;
+    int http_status = 0;
+
+    void client_send_redirect(client_t *client, const char *uuid, int status, const char *location);
+
+    switch (auth_user->alter_client_action) {
+        case AUTH_ALTER_NOOP:
+            return 0;
+        break;
+        case AUTH_ALTER_REWRITE:
+            free(client->uri);
+            client->uri = auth_user->alter_client_arg;
+            auth_user->alter_client_arg = NULL;
+            return 0;
+        break;
+        case AUTH_ALTER_REDIRECT:
+        /* fall through */
+        case AUTH_ALTER_REDIRECT_SEE_OTHER:
+            uuid = "be7fac90-54fb-4673-9e0d-d15d6a4963a2";
+            http_status = 303;
+            location = auth_user->alter_client_arg;
+        break;
+        case AUTH_ALTER_REDIRECT_TEMPORARY:
+            uuid = "4b08a03a-ecce-4981-badf-26b0bb6c9d9c";
+            http_status = 307;
+            location = auth_user->alter_client_arg;
+        break;
+        case AUTH_ALTER_REDIRECT_PERMANENT:
+            uuid = "36bf6815-95cb-4cc8-a7b0-6b4b0c82ac5d";
+            http_status = 308;
+            location = auth_user->alter_client_arg;
+        break;
+        case AUTH_ALTER_SEND_ERROR:
+            client_send_error_by_uuid(client, auth_user->alter_client_arg);
+            return 1;
+        break;
+    }
+
+    if (uuid && location && http_status) {
+        client_send_redirect(client, uuid, http_status, location);
+        return 1;
+    }
+
+    return -1;
+}
 static void __handle_auth_client (auth_t *auth, auth_client *auth_user) {
     auth_result result;
 
@@ -313,6 +367,11 @@ static void __handle_auth_client (auth_t *auth, auth_client *auth_user) {
         acl_addref(auth_user->client->acl = auth->acl);
         if (auth->role) /* TODO: Handle errors here */
             auth_user->client->role = strdup(auth->role);
+    }
+
+    if (result != AUTH_NOMATCH) {
+        if (__handle_auth_client_alter(auth, auth_user) == 1)
+            return;
     }
 
     if (result == AUTH_NOMATCH && auth_user->on_no_match) {
@@ -368,6 +427,7 @@ static void *auth_run_thread (void *arg)
  */
 static void auth_add_client(auth_t *auth, client_t *client, void (*on_no_match)(client_t *client, void (*on_result)(client_t *client, void *userdata, auth_result result), void *userdata), void (*on_result)(client_t *client, void *userdata, auth_result result), void *userdata) {
     auth_client *auth_user;
+    auth_matchtype_t matchtype;
 
     ICECAST_LOG_DEBUG("Trying to add client %p to auth %p's (role %s) queue.", client, auth, auth->role);
 
@@ -378,7 +438,35 @@ static void auth_add_client(auth_t *auth, client_t *client, void (*on_no_match)(
         return;
     }
 
-    if (!auth->method[client->parser->req_type]) {
+    if (auth->filter_method[client->parser->req_type] == AUTH_MATCHTYPE_NOMATCH) {
+        if (on_no_match) {
+           on_no_match(client, on_result, userdata);
+        } else if (on_result) {
+           on_result(client, userdata, AUTH_NOMATCH);
+        }
+        return;
+    }
+
+    if (client->admin_command == ADMIN_COMMAND_ERROR) {
+        /* this is a web/ client */
+        matchtype = auth->filter_web_policy;
+    } else {
+        /* this is a admin/ client */
+        size_t i;
+
+        matchtype = AUTH_MATCHTYPE_UNUSED;
+
+        for (i = 0; i < (sizeof(auth->filter_admin)/sizeof(*(auth->filter_admin))); i++) {
+            if (auth->filter_admin[i].type != AUTH_MATCHTYPE_UNUSED && auth->filter_admin[i].command == client->admin_command) {
+                matchtype = auth->filter_admin[i].type;
+                break;
+            }
+        }
+
+        if (matchtype == AUTH_MATCHTYPE_UNUSED)
+            matchtype = auth->filter_admin_policy;
+    }
+    if (matchtype == AUTH_MATCHTYPE_NOMATCH) {
         if (on_no_match) {
            on_no_match(client, on_result, userdata);
         } else if (on_result) {
@@ -404,11 +492,6 @@ static void auth_add_client(auth_t *auth, client_t *client, void (*on_no_match)(
 int auth_release_client (client_t *client) {
     if (!client->acl)
         return 0;
-
-
-    /* drop any queue reference here, we do not want a race between the source thread
-     * and the auth/fserve thread */
-    client_set_queue (client, NULL);
 
     if (client->auth && client->auth->release_client) {
         auth_client *auth_user = auth_client_setup(client);
@@ -472,13 +555,142 @@ static int get_authenticator (auth_t *auth, config_options_t *options)
 }
 
 
+static inline void auth_get_authenticator__filter_admin(auth_t *auth, xmlNodePtr node, size_t *filter_admin_index, const char *name, auth_matchtype_t matchtype)
+{
+    char * tmp = (char*)xmlGetProp(node, XMLSTR(name));
+
+    if (tmp) {
+        char *cur = tmp;
+        char *next;
+
+        while (cur) {
+            next = strstr(cur, ",");
+            if (next) {
+                *next = 0;
+                next++;
+                for (; *next == ' '; next++);
+            }
+
+            if (*filter_admin_index < (sizeof(auth->filter_admin)/sizeof(*(auth->filter_admin)))) {
+                auth->filter_admin[*filter_admin_index].command = admin_get_command(cur);
+                switch (auth->filter_admin[*filter_admin_index].command) {
+                    case ADMIN_COMMAND_ERROR:
+                        ICECAST_LOG_ERROR("Can not add unknown %s command to role.", name);
+                    break;
+                    case ADMIN_COMMAND_ANY:
+                        auth->filter_admin_policy = matchtype;
+                    break;
+                    default:
+                        auth->filter_admin[*filter_admin_index].type = matchtype;
+                        (*filter_admin_index)++;
+                    break;
+                }
+            } else {
+                ICECAST_LOG_ERROR("Can not add more %s commands to role.", name);
+            }
+
+            cur = next;
+        }
+
+        free(tmp);
+    }
+}
+
+static inline int auth_get_authenticator__filter_method(auth_t *auth, xmlNodePtr node, const char *name, auth_matchtype_t matchtype)
+{
+    char * tmp = (char*)xmlGetProp(node, XMLSTR(name));
+
+    if (tmp) {
+        char *cur = tmp;
+
+        while (cur) {
+            char *next = strstr(cur, ",");
+            httpp_request_type_e idx;
+
+            if (next) {
+                *next = 0;
+                next++;
+                for (; *next == ' '; next++);
+            }
+
+            if (strcmp(cur, "*") == 0) {
+                size_t i;
+
+                for (i = 0; i < (sizeof(auth->filter_method)/sizeof(*(auth->filter_method))); i++)
+                    auth->filter_method[i] = matchtype;
+                break;
+            }
+
+            idx = httpp_str_to_method(cur);
+            if (idx == httpp_req_unknown) {
+                ICECAST_LOG_ERROR("Can not add known method \"%H\" to role's %s", cur, name);
+                return -1;
+            }
+            auth->filter_method[idx] = matchtype;
+            cur = next;
+        }
+
+        free(tmp);
+    }
+
+    return 0;
+}
+
+static inline int auth_get_authenticator__permission_alter(auth_t *auth, xmlNodePtr node, const char *name, auth_matchtype_t matchtype)
+{
+    char * tmp = (char*)xmlGetProp(node, XMLSTR(name));
+
+    if (tmp) {
+        char *cur = tmp;
+
+        while (cur) {
+            char *next = strstr(cur, ",");
+            auth_alter_t idx;
+
+            if (next) {
+                *next = 0;
+                next++;
+                for (; *next == ' '; next++);
+            }
+
+            if (strcmp(cur, "*") == 0) {
+                size_t i;
+
+                for (i = 0; i < (sizeof(auth->permission_alter)/sizeof(*(auth->permission_alter))); i++)
+                    auth->permission_alter[i] = matchtype;
+                break;
+            }
+
+            idx = auth_str2alter(cur);
+            if (idx == AUTH_ALTER_NOOP) {
+                ICECAST_LOG_ERROR("Can not add unknown alter action \"%H\" to role's %s", cur, name);
+                return -1;
+            } else if (idx == AUTH_ALTER_REDIRECT) {
+                auth->permission_alter[AUTH_ALTER_REDIRECT] = matchtype;
+                auth->permission_alter[AUTH_ALTER_REDIRECT_SEE_OTHER] = matchtype;
+                auth->permission_alter[AUTH_ALTER_REDIRECT_TEMPORARY] = matchtype;
+                auth->permission_alter[AUTH_ALTER_REDIRECT_PERMANENT] = matchtype;
+            } else {
+                auth->permission_alter[idx] = matchtype;
+            }
+
+            cur = next;
+        }
+
+        free(tmp);
+    }
+
+    return 0;
+}
 auth_t *auth_get_authenticator(xmlNodePtr node)
 {
     auth_t *auth = calloc(1, sizeof(auth_t));
     config_options_t *options = NULL, **next_option = &options;
     xmlNodePtr option;
     char *method;
+    char *tmp;
     size_t i;
+    size_t filter_admin_index = 0;
 
     if (auth == NULL)
         return NULL;
@@ -489,6 +701,16 @@ auth_t *auth_get_authenticator(xmlNodePtr node)
     auth->type = (char*)xmlGetProp(node, XMLSTR("type"));
     auth->role = (char*)xmlGetProp(node, XMLSTR("name"));
     auth->management_url = (char*)xmlGetProp(node, XMLSTR("management-url"));
+    auth->filter_web_policy = AUTH_MATCHTYPE_MATCH;
+    auth->filter_admin_policy = AUTH_MATCHTYPE_MATCH;
+
+    for (i = 0; i < (sizeof(auth->filter_admin)/sizeof(*(auth->filter_admin))); i++) {
+        auth->filter_admin[i].type = AUTH_MATCHTYPE_UNUSED;
+        auth->filter_admin[i].command = ADMIN_COMMAND_ERROR;
+    }
+
+    for (i = 0; i < (sizeof(auth->permission_alter)/sizeof(*(auth->permission_alter))); i++)
+        auth->permission_alter[i] = AUTH_MATCHTYPE_NOMATCH;
 
     if (!auth->type) {
         auth_release(auth);
@@ -500,8 +722,8 @@ auth_t *auth_get_authenticator(xmlNodePtr node)
         char *cur = method;
         char *next;
 
-        for (i = 0; i < (sizeof(auth->method)/sizeof(*auth->method)); i++)
-            auth->method[i] = 0;
+        for (i = 0; i < (sizeof(auth->filter_method)/sizeof(*auth->filter_method)); i++)
+            auth->filter_method[i] = AUTH_MATCHTYPE_NOMATCH;
 
         while (cur) {
             httpp_request_type_e idx;
@@ -514,8 +736,8 @@ auth_t *auth_get_authenticator(xmlNodePtr node)
             }
 
             if (strcmp(cur, "*") == 0) {
-                for (i = 0; i < (sizeof(auth->method)/sizeof(*auth->method)); i++)
-                    auth->method[i] = 1;
+                for (i = 0; i < (sizeof(auth->filter_method)/sizeof(*auth->filter_method)); i++)
+                    auth->filter_method[i] = AUTH_MATCHTYPE_MATCH;
                 break;
             }
 
@@ -524,16 +746,45 @@ auth_t *auth_get_authenticator(xmlNodePtr node)
                 auth_release(auth);
                 return NULL;
             }
-            auth->method[idx] = 1;
+            auth->filter_method[idx] = AUTH_MATCHTYPE_MATCH;
 
             cur = next;
         }
 
         xmlFree(method);
     } else {
-        for (i = 0; i < (sizeof(auth->method)/sizeof(*auth->method)); i++)
-            auth->method[i] = 1;
+        for (i = 0; i < (sizeof(auth->filter_method)/sizeof(*auth->filter_method)); i++)
+            auth->filter_method[i] = AUTH_MATCHTYPE_MATCH;
     }
+
+    auth_get_authenticator__filter_method(auth, node, "match-method", AUTH_MATCHTYPE_MATCH);
+    auth_get_authenticator__filter_method(auth, node, "nomatch-method", AUTH_MATCHTYPE_NOMATCH);
+
+    tmp = (char*)xmlGetProp(node, XMLSTR("match-web"));
+    if (tmp) {
+        if (strcmp(tmp, "*") == 0) {
+            auth->filter_web_policy = AUTH_MATCHTYPE_MATCH;
+        } else {
+            auth->filter_web_policy = AUTH_MATCHTYPE_NOMATCH;
+        }
+        free(tmp);
+    }
+
+    tmp = (char*)xmlGetProp(node, XMLSTR("nomatch-web"));
+    if (tmp) {
+        if (strcmp(tmp, "*") == 0) {
+            auth->filter_web_policy = AUTH_MATCHTYPE_NOMATCH;
+        } else {
+            auth->filter_web_policy = AUTH_MATCHTYPE_MATCH;
+        }
+        free(tmp);
+    }
+
+    auth_get_authenticator__filter_admin(auth, node, &filter_admin_index, "match-admin", AUTH_MATCHTYPE_MATCH);
+    auth_get_authenticator__filter_admin(auth, node, &filter_admin_index, "nomatch-admin", AUTH_MATCHTYPE_NOMATCH);
+
+    auth_get_authenticator__permission_alter(auth, node, "may-alter", AUTH_MATCHTYPE_MATCH);
+    auth_get_authenticator__permission_alter(auth, node, "may-not-alter", AUTH_MATCHTYPE_NOMATCH);
 
     /* BEFORE RELEASE 2.5.0 TODO: Migrate this to config_parse_options(). */
     option = node->xmlChildrenNode;
@@ -598,6 +849,48 @@ auth_t *auth_get_authenticator(xmlNodePtr node)
     return auth;
 }
 
+int auth_alter_client(auth_t *auth, auth_client *auth_user, auth_alter_t action, const char *arg)
+{
+    if (!auth || !auth_user || !arg)
+        return -1;
+
+    if (action < 0 || action >= (sizeof(auth->permission_alter)/sizeof(*(auth->permission_alter))))
+        return -1;
+
+    if (auth->permission_alter[action] != AUTH_MATCHTYPE_MATCH)
+        return -1;
+
+    if (replace_string(&(auth_user->alter_client_arg), arg) != 0)
+        return -1;
+
+    auth_user->alter_client_action = action;
+
+    return 0;
+}
+
+auth_alter_t auth_str2alter(const char *str)
+{
+    if (!str)
+        return AUTH_ALTER_NOOP;
+
+    if (strcasecmp(str, "noop") == 0) {
+        return AUTH_ALTER_NOOP;
+    } else if (strcasecmp(str, "rewrite") == 0) {
+        return AUTH_ALTER_REWRITE;
+    } else if (strcasecmp(str, "redirect") == 0) {
+        return AUTH_ALTER_REDIRECT;
+    } else if (strcasecmp(str, "redirect_see_other") == 0) {
+        return AUTH_ALTER_REDIRECT_SEE_OTHER;
+    } else if (strcasecmp(str, "redirect_temporary") == 0) {
+        return AUTH_ALTER_REDIRECT_TEMPORARY;
+    } else if (strcasecmp(str, "redirect_permanent") == 0) {
+        return AUTH_ALTER_REDIRECT_PERMANENT;
+    } else if (strcasecmp(str, "send_error") == 0) {
+        return AUTH_ALTER_SEND_ERROR;
+    } else {
+        return AUTH_ALTER_NOOP;
+    }
+}
 
 /* these are called at server start and termination */
 
@@ -777,7 +1070,7 @@ acl_t        *auth_stack_get_anonymous_acl(auth_stack_t *stack, httpp_request_ty
 
     while (!ret && stack) {
         auth_t *auth = auth_stack_get(stack);
-        if (auth->method[method] && strcmp(auth->type, AUTH_TYPE_ANONYMOUS) == 0) {
+        if (auth->filter_method[method] != AUTH_MATCHTYPE_NOMATCH && strcmp(auth->type, AUTH_TYPE_ANONYMOUS) == 0) {
             acl_addref(ret = auth->acl);
         }
         auth_release(auth);
